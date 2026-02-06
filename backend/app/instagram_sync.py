@@ -2,6 +2,8 @@
 import random
 import sys
 import os
+import json
+import httpx
 from typing import Dict
 from playwright.sync_api import sync_playwright
 from datetime import datetime
@@ -19,6 +21,9 @@ def _get_log_file():
         # Also ensure debug directory exists
         debug_dir = os.path.join(log_dir, 'debug')
         os.makedirs(debug_dir, exist_ok=True)
+        # Also ensure api_logs directory exists
+        api_logs_dir = os.path.join(log_dir, 'api_logs')
+        os.makedirs(api_logs_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         _log_file = os.path.join(log_dir, f'playwright_{timestamp}.log')
     return _log_file
@@ -32,6 +37,20 @@ def _log(message: str):
             f.write(f"{message}\n")
     except:
         pass
+
+
+def _log_api_response(endpoint_type: str, response_data: dict):
+    """Log Instagram API response to a separate file for analysis."""
+    try:
+        log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs', 'api_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        filename = os.path.join(log_dir, f'{endpoint_type}_{timestamp}.json')
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(response_data, f, indent=2, ensure_ascii=False)
+        _log(f"[API] Logged {endpoint_type} response to: {filename}")
+    except Exception as e:
+        _log(f"[API] Failed to log response: {e}")
 
 
 def _create_browser_context(playwright, headless: bool = False):
@@ -252,10 +271,33 @@ def instagram_get_followers(username: str, session_cookies: list, limit: int = 5
         
         page = context.new_page()
         
+        # Set up network interception to capture API calls
+        api_responses = []
+        
+        def handle_response(response):
+            """Capture Instagram API responses."""
+            url = response.url
+            # Look for GraphQL or API endpoints related to followers
+            if 'graphql/query' in url or '/api/v1/' in url:
+                if 'followers' in url.lower() or 'follow' in url.lower():
+                    try:
+                        response_body = response.json()
+                        _log(f"[API] Captured followers API call: {url[:100]}...")
+                        _log_api_response('followers', {
+                            'url': url,
+                            'status': response.status,
+                            'data': response_body
+                        })
+                        api_responses.append(response_body)
+                    except Exception as e:
+                        _log(f"[API] Could not parse response: {e}")
+        
+        page.on("response", handle_response)
+        
         # Navigate to profile
         _log(f"[PLAYWRIGHT] Navigating to profile: {username}")
         page.goto(f'https://www.instagram.com/{username}/', wait_until='domcontentloaded', timeout=60000)
-        time.sleep(random.uniform(2, 4))
+        time.sleep(random.uniform(1, 2))
         
         # Click followers link
         _log(f"[PLAYWRIGHT] Looking for followers link...")
@@ -265,7 +307,7 @@ def instagram_get_followers(username: str, session_cookies: list, limit: int = 5
         
         followers_link.first.click()
         _log(f"[PLAYWRIGHT] Clicked followers link, waiting for dialog...")
-        time.sleep(3)
+        time.sleep(1)
         
         # Get the dialog and find the scrollable container
         _log(f"[PLAYWRIGHT] Looking for dialog...")
@@ -277,9 +319,8 @@ def instagram_get_followers(username: str, session_cookies: list, limit: int = 5
         # Instagram puts followers in a scrollable div with specific class/style
         _log(f"[PLAYWRIGHT] Finding scrollable container...")
         
-        # CRITICAL: Wait longer for Instagram to fully set up the scrollable container
-        # The debug script worked because we had more time between dialog open and scroll attempt
-        time.sleep(5)  # Increased from 2 to 5 seconds
+        # Wait for Instagram to fully set up the scrollable container
+        time.sleep(2)
         
         # Verify the scrollable div exists by checking
         scrollable_check = page.evaluate('''() => {
@@ -332,34 +373,48 @@ def instagram_get_followers(username: str, session_cookies: list, limit: int = 5
                     # Extract username from href
                     username_from_href = href.strip('/').split('/')[0]
                     
-                    if username_from_href and username_from_href not in seen_usernames:
-                        seen_usernames.add(username_from_href)
-                        
-                        # Try to get full name and verified status
-                        full_name = ""
-                        is_verified = False
-                        
-                        try:
-                            # Look for parent container
-                            parent = link.locator('xpath=../..')
-                            spans = parent.locator('span').all()
-                            if len(spans) > 0:
-                                full_name = spans[0].inner_text()
-                        except:
-                            pass
-                        
-                        try:
-                            # Check for verified badge
-                            verified_count = link.locator('xpath=../..').locator('svg[aria-label="Verified"]').count()
-                            is_verified = verified_count > 0
-                        except:
-                            pass
-                        
-                        followers.append({
-                            'username': username_from_href,
-                            'full_name': full_name,
-                            'is_verified': is_verified
-                        })
+                    # OPTIMIZATION: Skip if we've already processed this user
+                    if not username_from_href or username_from_href in seen_usernames:
+                        continue
+                    
+                    # Mark as seen immediately to avoid reprocessing
+                    seen_usernames.add(username_from_href)
+                    
+                    # Only do expensive DOM operations for NEW users
+                    full_name = ""
+                    is_verified = False
+                    profile_pic_url = ""
+                    
+                    try:
+                        # Look for parent container
+                        parent = link.locator('xpath=../..')
+                        spans = parent.locator('span').all()
+                        if len(spans) > 0:
+                            full_name = spans[0].inner_text()
+                    except:
+                        pass
+                    
+                    try:
+                        # Check for verified badge
+                        verified_count = link.locator('xpath=../..').locator('svg[aria-label="Verified"]').count()
+                        is_verified = verified_count > 0
+                    except:
+                        pass
+                    
+                    try:
+                        # Get profile picture URL
+                        img = link.locator('img').first
+                        if img:
+                            profile_pic_url = img.get_attribute('src') or ""
+                    except:
+                        pass
+                    
+                    followers.append({
+                        'username': username_from_href,
+                        'full_name': full_name,
+                        'is_verified': is_verified,
+                        'profile_pic_url': profile_pic_url
+                    })
                 except Exception as e:
                     # Skip problematic elements
                     continue
@@ -454,7 +509,7 @@ def instagram_get_followers(username: str, session_cookies: list, limit: int = 5
             else:
                 _log(f"[PLAYWRIGHT] WARNING: Scroll failed - {scroll_result.get('error')} (checked {scroll_result.get('totalDivs', 0)} divs, maxLinks: {scroll_result.get('maxLinksFound', 0)})")
             
-            time.sleep(random.uniform(2, 3))
+            time.sleep(random.uniform(0.5, 1))
         
         _log(f"[PLAYWRIGHT] Finished collecting followers: {len(followers)} total")
         
@@ -505,10 +560,33 @@ def instagram_get_following(username: str, session_cookies: list, limit: int = 5
         
         page = context.new_page()
         
+        # Set up network interception to capture API calls
+        api_responses = []
+        
+        def handle_response(response):
+            """Capture Instagram API responses."""
+            url = response.url
+            # Look for GraphQL or API endpoints related to following
+            if 'graphql/query' in url or '/api/v1/' in url:
+                if 'following' in url.lower() or 'follow' in url.lower():
+                    try:
+                        response_body = response.json()
+                        _log(f"[API] Captured following API call: {url[:100]}...")
+                        _log_api_response('following', {
+                            'url': url,
+                            'status': response.status,
+                            'data': response_body
+                        })
+                        api_responses.append(response_body)
+                    except Exception as e:
+                        _log(f"[API] Could not parse response: {e}")
+        
+        page.on("response", handle_response)
+        
         # Navigate to profile
         _log(f"[PLAYWRIGHT] Navigating to profile: {username}")
         page.goto(f'https://www.instagram.com/{username}/', wait_until='domcontentloaded', timeout=60000)
-        time.sleep(random.uniform(2, 4))
+        time.sleep(random.uniform(1, 2))
         
         # Click following link
         _log(f"[PLAYWRIGHT] Looking for following link...")
@@ -518,7 +596,7 @@ def instagram_get_following(username: str, session_cookies: list, limit: int = 5
         
         following_link.first.click()
         _log(f"[PLAYWRIGHT] Clicked following link, waiting for dialog...")
-        time.sleep(3)
+        time.sleep(1)
         
         # Get the dialog and prepare for scrolling
         _log(f"[PLAYWRIGHT] Looking for dialog...")
@@ -527,8 +605,8 @@ def instagram_get_following(username: str, session_cookies: list, limit: int = 5
             raise Exception("Following dialog did not appear")
         
         _log(f"[PLAYWRIGHT] Dialog found, waiting for scrollable container to render...")
-        # CRITICAL: Wait longer for Instagram to fully set up the scrollable container
-        time.sleep(5)  # Increased from 2 to 5 seconds
+        # Wait for Instagram to fully set up the scrollable container
+        time.sleep(2)
         
         _log(f"[PLAYWRIGHT] Dialog opened, starting to collect ALL following...")
         _log(f"[PLAYWRIGHT] This may take a while for large lists - will scroll until complete!")
@@ -555,34 +633,48 @@ def instagram_get_following(username: str, session_cookies: list, limit: int = 5
                     # Extract username from href
                     username_from_href = href.strip('/').split('/')[0]
                     
-                    if username_from_href and username_from_href not in seen_usernames:
-                        seen_usernames.add(username_from_href)
-                        
-                        # Try to get full name and verified status
-                        full_name = ""
-                        is_verified = False
-                        
-                        try:
-                            # Look for parent container
-                            parent = link.locator('xpath=../..')
-                            spans = parent.locator('span').all()
-                            if len(spans) > 0:
-                                full_name = spans[0].inner_text()
-                        except:
-                            pass
-                        
-                        try:
-                            # Check for verified badge
-                            verified_count = link.locator('xpath=../..').locator('svg[aria-label="Verified"]').count()
-                            is_verified = verified_count > 0
-                        except:
-                            pass
-                        
-                        following.append({
-                            'username': username_from_href,
-                            'full_name': full_name,
-                            'is_verified': is_verified
-                        })
+                    # OPTIMIZATION: Skip if we've already processed this user
+                    if not username_from_href or username_from_href in seen_usernames:
+                        continue
+                    
+                    # Mark as seen immediately to avoid reprocessing
+                    seen_usernames.add(username_from_href)
+                    
+                    # Only do expensive DOM operations for NEW users
+                    full_name = ""
+                    is_verified = False
+                    profile_pic_url = ""
+                    
+                    try:
+                        # Look for parent container
+                        parent = link.locator('xpath=../..')
+                        spans = parent.locator('span').all()
+                        if len(spans) > 0:
+                            full_name = spans[0].inner_text()
+                    except:
+                        pass
+                    
+                    try:
+                        # Check for verified badge
+                        verified_count = link.locator('xpath=../..').locator('svg[aria-label="Verified"]').count()
+                        is_verified = verified_count > 0
+                    except:
+                        pass
+                    
+                    try:
+                        # Get profile picture URL
+                        img = link.locator('img').first
+                        if img:
+                            profile_pic_url = img.get_attribute('src') or ""
+                    except:
+                        pass
+                    
+                    following.append({
+                        'username': username_from_href,
+                        'full_name': full_name,
+                        'is_verified': is_verified,
+                        'profile_pic_url': profile_pic_url
+                    })
                 except Exception as e:
                     # Skip problematic elements
                     continue
@@ -679,7 +771,7 @@ def instagram_get_following(username: str, session_cookies: list, limit: int = 5
                 print(f"[PLAYWRIGHT] WARNING: Scroll failed - {scroll_result.get('error')} (checked {scroll_result.get('totalDivs', 0)} divs)")
                 sys.stdout.flush()
             
-            time.sleep(random.uniform(2, 3))
+            time.sleep(random.uniform(0.5, 1))
         
         _log(f"[PLAYWRIGHT] Finished collecting following: {len(following)} total")
         
@@ -714,6 +806,371 @@ def instagram_get_following(username: str, session_cookies: list, limit: int = 5
         return {'success': False, 'error': str(e)}
 
 
+# ============================================================================
+# API-BASED SCRAPERS (Faster, more reliable alternative to HTML scraping)
+# ============================================================================
+
+def instagram_get_followers_api(username: str, session_cookies: list, limit: int = 999999, headless: bool = False) -> Dict:
+    """Fetch followers using Instagram's internal API (much faster than HTML scraping).
+    
+    This accesses the same API that Instagram's web app uses, providing structured JSON data.
+    Falls back to HTML scraping if API approach fails.
+    """
+    playwright = None
+    browser = None
+    
+    try:
+        _log(f"[API] Starting API-based followers fetch for {username}...")
+        playwright = sync_playwright().start()
+        browser, context = _create_browser_context(playwright, headless)
+        
+        # Load session cookies
+        _log(f"[API] Loading {len(session_cookies)} session cookies...")
+        context.add_cookies(session_cookies)
+        
+        page = context.new_page()
+        
+        # First, navigate to profile to get user ID
+        _log(f"[API] Navigating to profile to extract user ID...")
+        page.goto(f'https://www.instagram.com/{username}/', wait_until='domcontentloaded', timeout=60000)
+        time.sleep(1)
+        
+        # Extract user ID from page source
+        user_id = None
+        try:
+            # Instagram embeds user data in script tags
+            user_id = page.evaluate('''() => {
+                const scripts = document.querySelectorAll('script');
+                for (let script of scripts) {
+                    const text = script.textContent;
+                    if (text.includes('"user_id"') || text.includes('"id"')) {
+                        // Try to extract user ID from various patterns
+                        const match = text.match(/"user_id":"(\\d+)"/);
+                        if (match) return match[1];
+                        const match2 = text.match(/"id":"(\\d+)"/);
+                        if (match2) return match2[1];
+                    }
+                }
+                return null;
+            }''')
+            _log(f"[API] Extracted user ID: {user_id}")
+        except Exception as e:
+            _log(f"[API] Could not extract user ID: {e}")
+        
+        if not user_id:
+            _log(f"[API] Failed to get user ID, falling back to HTML scraper...")
+            browser.close()
+            playwright.stop()
+            # Fall back to HTML scraping
+            return instagram_get_followers(username, session_cookies, limit, headless)
+        
+        followers = []
+        seen_usernames = set()
+        next_max_id = None
+        request_count = 0
+        
+        _log(f"[API] Starting API pagination for user ID {user_id}...")
+        
+        # Extract CSRF token from cookies for API requests
+        csrf_token = None
+        for cookie in session_cookies:
+            if cookie.get('name') == 'csrftoken':
+                csrf_token = cookie.get('value')
+                break
+        
+        if not csrf_token:
+            _log(f"[API] No CSRF token found, falling back to HTML scraper...")
+            browser.close()
+            playwright.stop()
+            return instagram_get_followers(username, session_cookies, limit, headless)
+        
+        _log(f"[API] Found CSRF token: {csrf_token[:20]}...")
+        
+        while len(followers) < limit:
+            request_count += 1
+            
+            # Build API URL
+            api_url = f"https://www.instagram.com/api/v1/friendships/{user_id}/followers/?count=200"
+            if next_max_id:
+                api_url += f"&max_id={next_max_id}"
+            
+            _log(f"[API] Request {request_count}: Fetching up to 200 followers...")
+            
+            try:
+                # Make API request with required Instagram headers
+                response = page.request.get(api_url, headers={
+                    'x-ig-app-id': '936619743392459',  # Instagram web app ID
+                    'x-asbd-id': '129477',
+                    'x-csrftoken': csrf_token,
+                    'x-requested-with': 'XMLHttpRequest'
+                })
+                
+                if response.status != 200:
+                    _log(f"[API] Error: Got status {response.status}")
+                    try:
+                        error_body = response.text()
+                        _log(f"[API] Response body: {error_body[:500]}")
+                    except:
+                        pass
+                    _log(f"[API] Falling back to HTML scraper due to API error...")
+                    # Close browser and fall back
+                    page.close()
+                    context.close()
+                    browser.close()
+                    playwright.stop()
+                    return instagram_get_followers(username, session_cookies, limit, headless)
+                
+                data = response.json()
+                
+                # Log the response for debugging
+                _log_api_response(f'followers_api_batch_{request_count}', {
+                    'url': api_url,
+                    'status': response.status,
+                    'data': data
+                })
+                
+                # Extract users from response
+                users = data.get('users', [])
+                _log(f"[API] Received {len(users)} users in this batch")
+                
+                for user in users:
+                    username_str = user.get('username')
+                    if username_str and username_str not in seen_usernames:
+                        seen_usernames.add(username_str)
+                        
+                        followers.append({
+                            'username': username_str,
+                            'full_name': user.get('full_name', ''),
+                            'is_verified': user.get('is_verified', False),
+                            'profile_pic_url': user.get('profile_pic_url', ''),
+                            'user_id': user.get('pk', ''),
+                            'is_private': user.get('is_private', False),
+                            'has_anonymous_profile_picture': user.get('has_anonymous_profile_picture', False),
+                            'latest_reel_media': user.get('latest_reel_media', 0)
+                        })
+                
+                # Check if there are more results
+                has_more = data.get('has_more', False)
+                next_max_id = data.get('next_max_id')
+                
+                _log(f"[API] Total collected so far: {len(followers)} | Has more: {has_more}")
+                
+                if not has_more or not next_max_id:
+                    _log(f"[API] Reached end of followers list")
+                    break
+                
+                # Small delay between requests to be respectful
+                time.sleep(random.uniform(0.5, 1))
+                
+            except Exception as e:
+                _log(f"[API] Error during pagination: {e}")
+                break
+        
+        # Close browser
+        page.close()
+        context.close()
+        browser.close()
+        playwright.stop()
+        
+        _log(f"[API] Successfully fetched {len(followers)} followers via API in {request_count} requests")
+        
+        return {
+            'success': True,
+            'followers': followers[:limit],
+            'count': len(followers[:limit]),
+            'method': 'api'
+        }
+        
+    except Exception as e:
+        _log(f"[API] Exception in get_followers_api: {str(e)}")
+        if browser:
+            browser.close()
+        if playwright:
+            playwright.stop()
+        
+        # Fall back to HTML scraping
+        _log(f"[API] Falling back to HTML scraper due to error...")
+        return instagram_get_followers(username, session_cookies, limit, headless)
+
+
+def instagram_get_following_api(username: str, session_cookies: list, limit: int = 999999, headless: bool = False) -> Dict:
+    """Fetch following using Instagram's internal API (much faster than HTML scraping).
+    
+    This accesses the same API that Instagram's web app uses, providing structured JSON data.
+    Falls back to HTML scraping if API approach fails.
+    """
+    playwright = None
+    browser = None
+    
+    try:
+        _log(f"[API] Starting API-based following fetch for {username}...")
+        playwright = sync_playwright().start()
+        browser, context = _create_browser_context(playwright, headless)
+        
+        # Load session cookies
+        _log(f"[API] Loading {len(session_cookies)} session cookies...")
+        context.add_cookies(session_cookies)
+        
+        page = context.new_page()
+        
+        # First, navigate to profile to get user ID
+        _log(f"[API] Navigating to profile to extract user ID...")
+        page.goto(f'https://www.instagram.com/{username}/', wait_until='domcontentloaded', timeout=60000)
+        time.sleep(1)
+        
+        # Extract user ID from page source
+        user_id = None
+        try:
+            user_id = page.evaluate('''() => {
+                const scripts = document.querySelectorAll('script');
+                for (let script of scripts) {
+                    const text = script.textContent;
+                    if (text.includes('"user_id"') || text.includes('"id"')) {
+                        const match = text.match(/"user_id":"(\\d+)"/);
+                        if (match) return match[1];
+                        const match2 = text.match(/"id":"(\\d+)"/);
+                        if (match2) return match2[1];
+                    }
+                }
+                return null;
+            }''')
+            _log(f"[API] Extracted user ID: {user_id}")
+        except Exception as e:
+            _log(f"[API] Could not extract user ID: {e}")
+        
+        if not user_id:
+            _log(f"[API] Failed to get user ID, falling back to HTML scraper...")
+            browser.close()
+            playwright.stop()
+            return instagram_get_following(username, session_cookies, limit, headless)
+        
+        following = []
+        seen_usernames = set()
+        next_max_id = None
+        request_count = 0
+        
+        _log(f"[API] Starting API pagination for user ID {user_id}...")
+        
+        # Extract CSRF token from cookies for API requests
+        csrf_token = None
+        for cookie in session_cookies:
+            if cookie.get('name') == 'csrftoken':
+                csrf_token = cookie.get('value')
+                break
+        
+        if not csrf_token:
+            _log(f"[API] No CSRF token found, falling back to HTML scraper...")
+            browser.close()
+            playwright.stop()
+            return instagram_get_following(username, session_cookies, limit, headless)
+        
+        _log(f"[API] Found CSRF token: {csrf_token[:20]}...")
+        
+        while len(following) < limit:
+            request_count += 1
+            
+            # Build API URL
+            api_url = f"https://www.instagram.com/api/v1/friendships/{user_id}/following/?count=200"
+            if next_max_id:
+                api_url += f"&max_id={next_max_id}"
+            
+            _log(f"[API] Request {request_count}: Fetching up to 200 following...")
+            
+            try:
+                # Make API request with required Instagram headers
+                response = page.request.get(api_url, headers={
+                    'x-ig-app-id': '936619743392459',  # Instagram web app ID
+                    'x-asbd-id': '129477',
+                    'x-csrftoken': csrf_token,
+                    'x-requested-with': 'XMLHttpRequest'
+                })
+                
+                if response.status != 200:
+                    _log(f"[API] Error: Got status {response.status}")
+                    try:
+                        error_body = response.text()
+                        _log(f"[API] Response body: {error_body[:500]}")
+                    except:
+                        pass
+                    _log(f"[API] Falling back to HTML scraper due to API error...")
+                    # Close browser and fall back
+                    page.close()
+                    context.close()
+                    browser.close()
+                    playwright.stop()
+                    return instagram_get_following(username, session_cookies, limit, headless)
+                
+                data = response.json()
+                
+                _log_api_response(f'following_api_batch_{request_count}', {
+                    'url': api_url,
+                    'status': response.status,
+                    'data': data
+                })
+                
+                users = data.get('users', [])
+                _log(f"[API] Received {len(users)} users in this batch")
+                
+                for user in users:
+                    username_str = user.get('username')
+                    if username_str and username_str not in seen_usernames:
+                        seen_usernames.add(username_str)
+                        
+                        following.append({
+                            'username': username_str,
+                            'full_name': user.get('full_name', ''),
+                            'is_verified': user.get('is_verified', False),
+                            'profile_pic_url': user.get('profile_pic_url', ''),
+                            'user_id': user.get('pk', ''),
+                            'is_private': user.get('is_private', False),
+                            'has_anonymous_profile_picture': user.get('has_anonymous_profile_picture', False),
+                            'latest_reel_media': user.get('latest_reel_media', 0)
+                        })
+                
+                has_more = data.get('has_more', False)
+                next_max_id = data.get('next_max_id')
+                
+                _log(f"[API] Total collected so far: {len(following)} | Has more: {has_more}")
+                
+                if not has_more or not next_max_id:
+                    _log(f"[API] Reached end of following list")
+                    break
+                
+                time.sleep(random.uniform(0.5, 1))
+                
+            except Exception as e:
+                _log(f"[API] Error during pagination: {e}")
+                break
+        
+        page.close()
+        context.close()
+        browser.close()
+        playwright.stop()
+        
+        _log(f"[API] Successfully fetched {len(following)} following via API in {request_count} requests")
+        
+        return {
+            'success': True,
+            'following': following[:limit],
+            'count': len(following[:limit]),
+            'method': 'api'
+        }
+        
+    except Exception as e:
+        _log(f"[API] Exception in get_following_api: {str(e)}")
+        if browser:
+            browser.close()
+        if playwright:
+            playwright.stop()
+        
+        _log(f"[API] Falling back to HTML scraper due to error...")
+        return instagram_get_following(username, session_cookies, limit, headless)
+
+
+# ============================================================================
+# UNFOLLOW FUNCTIONS
+# ============================================================================
+
 def instagram_unfollow_user(username: str, session_cookies: list, headless: bool = False) -> Dict:
     """Unfollow a single user using sync Playwright."""
     playwright = None
@@ -728,6 +1185,33 @@ def instagram_unfollow_user(username: str, session_cookies: list, headless: bool
         context.add_cookies(session_cookies)
         
         page = context.new_page()
+        
+        # Network interception for unfollow API - log ALL POST requests to see what Instagram uses
+        def log_unfollow_api(response):
+            try:
+                # Log all POST requests to Instagram
+                if response.request.method == 'POST' and 'instagram.com' in response.url:
+                    _log(f"[NETWORK] POST to: {response.url}")
+                    _log(f"[NETWORK] Status: {response.status}")
+                    
+                    # If it looks like an API endpoint, log full details
+                    if '/api/' in response.url or 'friendships' in response.url or '/graphql/query' in response.url or '/sync/' in response.url:
+                        _log(f"[UNFOLLOW-API] ⭐ Full API Details:")
+                        _log(f"[UNFOLLOW-API] URL: {response.url}")
+                        _log(f"[UNFOLLOW-API] Status: {response.status}")
+                        _log(f"[UNFOLLOW-API] Method: {response.request.method}")
+                        _log(f"[UNFOLLOW-API] Headers: {dict(response.request.headers)}")
+                        if response.request.post_data:
+                            _log(f"[UNFOLLOW-API] Post Data: {response.request.post_data}")
+                        try:
+                            body = response.json()
+                            _log(f"[UNFOLLOW-API] Response: {json.dumps(body, indent=2)}")
+                        except:
+                            pass
+            except Exception as e:
+                pass  # Silently ignore errors in logging
+        
+        page.on('response', log_unfollow_api)
         
         # Navigate to user's profile
         _log(f"[PLAYWRIGHT] Navigating to profile: {username}")
@@ -753,19 +1237,40 @@ def instagram_unfollow_user(username: str, session_cookies: list, headless: bool
         
         # Click Unfollow in the confirmation dialog
         _log(f"[PLAYWRIGHT] Looking for Unfollow confirmation...")
-        unfollow_button = page.locator('button:has-text("Unfollow")')
         
-        if not unfollow_button.is_visible(timeout=3000):
-            _log(f"[PLAYWRIGHT] Unfollow confirmation dialog not found")
+        # Take screenshot for debugging
+        try:
+            screenshot_path = f"c:/GitHub/johnapaez/instagram-tool/backend/logs/debug/unfollow_dialog_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            page.screenshot(path=screenshot_path)
+            _log(f"[PLAYWRIGHT] Dialog screenshot saved to: {screenshot_path}")
+        except Exception as screenshot_error:
+            _log(f"[PLAYWRIGHT] Failed to save screenshot: {screenshot_error}")
+        
+        # Log all visible buttons for debugging
+        all_buttons = page.locator('button').all()
+        _log(f"[PLAYWRIGHT] Found {len(all_buttons)} buttons on page")
+        for i, btn in enumerate(all_buttons[:10]):  # Log first 10 buttons
+            try:
+                text = btn.text_content() or ""
+                if text.strip():
+                    _log(f"[PLAYWRIGHT] Button {i}: '{text.strip()}'")
+            except:
+                pass
+        
+        # Try flexible selector to find Unfollow in menu/dialog (not just buttons)
+        unfollow_element = page.locator('[role="menuitem"]:has-text("Unfollow"), button:has-text("Unfollow"), span:has-text("Unfollow")').first
+        
+        if not unfollow_element.is_visible(timeout=5000):
+            _log(f"[PLAYWRIGHT] Unfollow option not found in menu")
             page.close()
             context.close()
             browser.close()
             playwright.stop()
-            return {'success': False, 'username': username, 'error': 'Unfollow confirmation dialog not found'}
+            return {'success': False, 'username': username, 'error': 'Unfollow option not found'}
         
-        # Click the Unfollow button in the dialog
+        # Click the Unfollow option
         _log(f"[PLAYWRIGHT] Clicking Unfollow...")
-        unfollow_button.first.click()
+        unfollow_element.click()
         time.sleep(random.uniform(2, 3))
         
         _log(f"[PLAYWRIGHT] Successfully unfollowed: {username}")
@@ -840,6 +1345,178 @@ def instagram_unfollow_batch(usernames: list, session_cookies: list, min_delay: 
         'results': results,
         'summary': {
             'total': len(usernames),
+            'successful': successful,
+            'failed': failed
+        }
+    }
+
+
+# ============================================================================
+# API-BASED UNFOLLOW FUNCTIONS (Primary method)
+# ============================================================================
+
+def _extract_tokens_from_cookies(session_cookies: list) -> Dict:
+    """Extract CSRF token and other required tokens from session cookies."""
+    tokens = {
+        'csrftoken': None,
+        'sessionid': None
+    }
+    
+    for cookie in session_cookies:
+        if cookie['name'] == 'csrftoken':
+            tokens['csrftoken'] = cookie['value']
+        elif cookie['name'] == 'sessionid':
+            tokens['sessionid'] = cookie['value']
+    
+    return tokens
+
+
+def instagram_unfollow_user_api(user_id: str, username: str, session_cookies: list) -> Dict:
+    """Unfollow a user using Instagram's API directly (faster, no browser)."""
+    try:
+        _log(f"[API-UNFOLLOW] Starting API unfollow for: {username} (ID: {user_id})")
+        
+        # Extract tokens from cookies
+        tokens = _extract_tokens_from_cookies(session_cookies)
+        
+        if not tokens['csrftoken'] or not tokens['sessionid']:
+            _log(f"[API-UNFOLLOW] Missing required tokens")
+            return {'success': False, 'username': username, 'error': 'Missing authentication tokens'}
+        
+        # Prepare cookies for httpx
+        cookies = {}
+        for cookie in session_cookies:
+            cookies[cookie['name']] = cookie['value']
+        
+        # Instagram API endpoint
+        url = "https://www.instagram.com/graphql/query"
+        
+        # Required headers (from captured API call)
+        headers = {
+            'authority': 'www.instagram.com',
+            'accept': '*/*',
+            'accept-language': 'en-US,en;q=0.9',
+            'content-type': 'application/x-www-form-urlencoded',
+            'origin': 'https://www.instagram.com',
+            'referer': f'https://www.instagram.com/{username}/',
+            'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'x-asbd-id': '129477',
+            'x-csrftoken': tokens['csrftoken'],
+            'x-fb-friendly-name': 'usePolarisUnfollowMutation',
+            'x-fb-lsd': 'AVq-9YjDn5g',  # This might need to be dynamic
+            'x-ig-app-id': '936619743392459',
+            'x-ig-www-claim': '0',
+            'x-requested-with': 'XMLHttpRequest',
+        }
+        
+        # Prepare payload
+        variables = json.dumps({
+            "target_user_id": str(user_id),
+            "container_module": "profile"
+        })
+        
+        payload = {
+            'variables': variables,
+            'doc_id': '9846833695423773'
+        }
+        
+        _log(f"[API-UNFOLLOW] Sending request to Instagram API...")
+        
+        # Make the API call
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(url, headers=headers, cookies=cookies, data=payload)
+            
+            _log(f"[API-UNFOLLOW] Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    # Check if the unfollow was successful
+                    if 'data' in data or 'status' in data:
+                        _log(f"[API-UNFOLLOW] Successfully unfollowed: {username}")
+                        return {
+                            'success': True,
+                            'username': username,
+                            'method': 'api',
+                            'timestamp': datetime.now().isoformat()
+                        }
+                    else:
+                        _log(f"[API-UNFOLLOW] Unexpected response: {data}")
+                        return {'success': False, 'username': username, 'error': 'Unexpected API response'}
+                except json.JSONDecodeError:
+                    _log(f"[API-UNFOLLOW] Failed to parse response")
+                    return {'success': False, 'username': username, 'error': 'Invalid JSON response'}
+            else:
+                _log(f"[API-UNFOLLOW] HTTP error: {response.status_code}")
+                return {'success': False, 'username': username, 'error': f'HTTP {response.status_code}'}
+                
+    except Exception as e:
+        _log(f"[API-UNFOLLOW] Exception: {str(e)}")
+        return {'success': False, 'username': username, 'error': str(e)}
+
+
+def instagram_unfollow_batch_api(user_data: list, session_cookies: list, delay: int = 3) -> Dict:
+    """
+    Unfollow multiple users using API (primary method).
+    user_data: List of dicts with 'username' and 'user_id' keys
+    """
+    _log(f"[API-UNFOLLOW] ========================================")
+    _log(f"[API-UNFOLLOW] Starting batch API unfollow")
+    _log(f"[API-UNFOLLOW] Users to unfollow: {len(user_data)}")
+    _log(f"[API-UNFOLLOW] Delay between calls: {delay} seconds")
+    _log(f"[API-UNFOLLOW] ========================================")
+    
+    results = []
+    successful = 0
+    failed = 0
+    
+    for i, user in enumerate(user_data):
+        username = user['username']
+        user_id = user.get('user_id')
+        
+        _log(f"[API-UNFOLLOW] Processing {i+1}/{len(user_data)}: {username}")
+        
+        # Check if we have user_id
+        if not user_id:
+            _log(f"[API-UNFOLLOW] No user_id for {username}, skipping API method")
+            result = {'success': False, 'username': username, 'error': 'No user_id available'}
+            results.append(result)
+            failed += 1
+            continue
+        
+        # Unfollow via API
+        result = instagram_unfollow_user_api(user_id, username, session_cookies)
+        results.append(result)
+        
+        if result['success']:
+            successful += 1
+            _log(f"[API-UNFOLLOW] Success ({successful}/{len(user_data)})")
+        else:
+            failed += 1
+            _log(f"[API-UNFOLLOW] Failed: {result.get('error', 'Unknown error')} ({failed} failures)")
+        
+        # Add delay between API calls (except for the last one)
+        if i < len(user_data) - 1:
+            _log(f"[API-UNFOLLOW] Waiting {delay} seconds before next API call...")
+            time.sleep(delay)
+    
+    _log(f"[API-UNFOLLOW] ========================================")
+    _log(f"[API-UNFOLLOW] Batch API unfollow complete!")
+    _log(f"[API-UNFOLLOW] Successful: {successful}")
+    _log(f"[API-UNFOLLOW] Failed: {failed}")
+    _log(f"[API-UNFOLLOW] ========================================")
+    
+    return {
+        'success': failed == 0,
+        'results': results,
+        'summary': {
+            'total': len(user_data),
             'successful': successful,
             'failed': failed
         }

@@ -1,6 +1,7 @@
 """FastAPI main application."""
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict
 from pydantic import BaseModel
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta
 import asyncio
 import uuid
 import sys
+import httpx
 
 # Fix for Windows - use WindowsProactorEventLoopPolicy for subprocess support
 if sys.platform == 'win32':
@@ -16,7 +18,15 @@ if sys.platform == 'win32':
 from .config import settings
 from .database import get_db, init_db
 from .models import User, Action, Session as DBSession, UnfollowQueue
-from .instagram_sync import instagram_login, instagram_get_followers, instagram_get_following, instagram_unfollow_batch
+from .instagram_sync import (
+    instagram_login,
+    instagram_get_followers,
+    instagram_get_following,
+    instagram_get_followers_api,
+    instagram_get_following_api,
+    instagram_unfollow_batch,
+    instagram_unfollow_batch_api
+)
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(
@@ -57,6 +67,7 @@ class LoginResponse(BaseModel):
 class UserInfo(BaseModel):
     username: str
     full_name: Optional[str] = None
+    profile_pic_url: Optional[str] = None
     is_verified: bool = False
     follower_count: int = 0
     is_following_me: bool = False
@@ -131,6 +142,33 @@ async def root():
         "version": "1.0.0",
         "docs": "/docs"
     }
+
+
+@app.get("/api/proxy/image")
+async def proxy_image(url: str):
+    """Proxy Instagram profile images to bypass CORS restrictions."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                },
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                return Response(
+                    content=response.content,
+                    media_type=response.headers.get("content-type", "image/jpeg"),
+                    headers={
+                        "Cache-Control": "public, max-age=86400",  # Cache for 24 hours
+                    }
+                )
+            else:
+                raise HTTPException(status_code=response.status_code, detail="Failed to fetch image")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image proxy error: {str(e)}")
 
 
 @app.post("/api/auth/login", response_model=LoginResponse)
@@ -253,13 +291,13 @@ async def get_followers(
         if not db_session:
             raise HTTPException(status_code=401, detail="Invalid or expired session")
         
-        print(f"[FOLLOWERS] Session valid, fetching followers...")
+        print(f"[FOLLOWERS] Session valid, fetching followers (trying API first)...")
         
-        # Run in thread pool
+        # Run in thread pool - Try API scraper first
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             executor,
-            instagram_get_followers,
+            instagram_get_followers_api,
             username,
             db_session.cookies,
             limit,
@@ -273,13 +311,14 @@ async def get_followers(
         followers = result['followers']
         print(f"[FOLLOWERS] Successfully fetched {len(followers)} followers")
         
-        # IMPORTANT: Reset all is_following_me flags to False before updating
-        # This ensures stale data doesn't persist
-        print(f"[FOLLOWERS] Resetting all is_following_me flags...")
-        db.query(User).update({User.is_following_me: False})
-        db.commit()
+        # TWO-PHASE COMMIT: Only update database if collection succeeded
+        # This prevents data loss if collection is interrupted
+        print(f"[FOLLOWERS] Starting database update (two-phase commit)...")
         
-        # Store in database
+        # Phase 1: Reset all is_following_me flags
+        db.query(User).update({User.is_following_me: False})
+        
+        # Phase 2: Update with new data
         follower_usernames = set()
         for follower in followers:
             follower_usernames.add(follower['username'])
@@ -287,35 +326,41 @@ async def get_followers(
             if existing_user:
                 existing_user.full_name = follower.get('full_name', '')
                 existing_user.is_verified = follower.get('is_verified', False)
+                existing_user.profile_pic_url = follower.get('profile_pic_url', '')
+                # Update user_id if we got it from API
+                if follower.get('user_id'):
+                    existing_user.user_id = str(follower.get('user_id'))
                 existing_user.is_following_me = True
                 existing_user.updated_at = datetime.utcnow()
             else:
                 new_user = User(
                     username=follower['username'],
-                    user_id=follower['username'],  # We'll use username as ID for now
+                    user_id=str(follower.get('user_id', follower['username'])),  # Use real ID if available
                     full_name=follower.get('full_name', ''),
                     is_verified=follower.get('is_verified', False),
+                    profile_pic_url=follower.get('profile_pic_url', ''),
                     is_following_me=True
                 )
                 db.add(new_user)
         
-        print(f"[FOLLOWERS] Stored {len(follower_usernames)} unique followers")
+        print(f"[FOLLOWERS] Processed {len(follower_usernames)} unique followers")
         
         # Log action
         action = Action(
             action_type='fetch_followers',
             username=username,
             status='success',
-            details={'count': len(followers)}
+            details={'count': len(followers), 'method': result.get('method', 'html')}
         )
         db.add(action)
         db.commit()
         
-        print(f"[FOLLOWERS] SUCCESS! Stored in database.")
+        print(f"[FOLLOWERS] SUCCESS! Stored in database using {result.get('method', 'html')} method.")
         return {
             "success": True,
             "count": len(followers),
-            "followers": followers
+            "followers": followers,
+            "method": result.get('method', 'html')
         }
         
     except HTTPException:
@@ -353,13 +398,13 @@ async def get_following(
         if not db_session:
             raise HTTPException(status_code=401, detail="Invalid or expired session")
         
-        print(f"[FOLLOWING] Session valid, fetching following...")
+        print(f"[FOLLOWING] Session valid, fetching following (trying API first)...")
         
-        # Run in thread pool
+        # Run in thread pool - Try API scraper first
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             executor,
-            instagram_get_following,
+            instagram_get_following_api,
             username,
             db_session.cookies,
             limit,
@@ -373,13 +418,14 @@ async def get_following(
         following = result['following']
         print(f"[FOLLOWING] Successfully fetched {len(following)} following")
         
-        # IMPORTANT: Reset all i_am_following flags to False before updating
-        # This ensures stale data doesn't persist
-        print(f"[FOLLOWING] Resetting all i_am_following flags...")
-        db.query(User).update({User.i_am_following: False})
-        db.commit()
+        # TWO-PHASE COMMIT: Only update database if collection succeeded
+        # This prevents data loss if collection is interrupted
+        print(f"[FOLLOWING] Starting database update (two-phase commit)...")
         
-        # Store in database
+        # Phase 1: Reset all i_am_following flags
+        db.query(User).update({User.i_am_following: False})
+        
+        # Phase 2: Update with new data
         following_usernames = set()
         for followed_user in following:
             following_usernames.add(followed_user['username'])
@@ -387,35 +433,41 @@ async def get_following(
             if existing_user:
                 existing_user.full_name = followed_user.get('full_name', '')
                 existing_user.is_verified = followed_user.get('is_verified', False)
+                existing_user.profile_pic_url = followed_user.get('profile_pic_url', '')
+                # Update user_id if we got it from API
+                if followed_user.get('user_id'):
+                    existing_user.user_id = str(followed_user.get('user_id'))
                 existing_user.i_am_following = True
                 existing_user.updated_at = datetime.utcnow()
             else:
                 new_user = User(
                     username=followed_user['username'],
-                    user_id=followed_user['username'],
+                    user_id=str(followed_user.get('user_id', followed_user['username'])),  # Use real ID if available
                     full_name=followed_user.get('full_name', ''),
                     is_verified=followed_user.get('is_verified', False),
+                    profile_pic_url=followed_user.get('profile_pic_url', ''),
                     i_am_following=True
                 )
                 db.add(new_user)
         
-        print(f"[FOLLOWING] Stored {len(following_usernames)} unique following users")
+        print(f"[FOLLOWING] Processed {len(following_usernames)} unique following users")
         
         # Log action
         action = Action(
             action_type='fetch_following',
             username=username,
             status='success',
-            details={'count': len(following)}
+            details={'count': len(following), 'method': result.get('method', 'html')}
         )
         db.add(action)
         db.commit()
         
-        print(f"[FOLLOWING] SUCCESS! Stored in database.")
+        print(f"[FOLLOWING] SUCCESS! Stored in database using {result.get('method', 'html')} method.")
         return {
             "success": True,
             "count": len(following),
-            "following": following
+            "following": following,
+            "method": result.get('method', 'html')
         }
         
     except HTTPException:
@@ -600,14 +652,11 @@ async def complete_analysis(
 @app.get("/api/analysis/non-followers", response_model=AnalysisResponse)
 async def get_non_followers(
     session_id: str,
-    min_followers: int = 10000,
-    exclude_verified: bool = True,
     db: Session = Depends(get_db)
 ):
     """Get list of users who don't follow back."""
     print(f"[NON-FOLLOWERS] ========================================")
     print(f"[NON-FOLLOWERS] Analyzing non-followers")
-    print(f"[NON-FOLLOWERS] Filters: verified={exclude_verified}, min_followers={min_followers}")
     print(f"[NON-FOLLOWERS] ========================================")
     
     try:
@@ -621,20 +670,11 @@ async def get_non_followers(
         
         # Get all users I'm following but who don't follow me
         # EXCLUDE whitelisted users
-        query = db.query(User).filter(
+        non_followers = db.query(User).filter(
             User.i_am_following == True,
             User.is_following_me == False,
             User.is_whitelisted == False  # Don't show whitelisted users
-        )
-        
-        # Apply filters
-        if exclude_verified:
-            query = query.filter(User.is_verified == False)
-        
-        if min_followers > 0:
-            query = query.filter(User.follower_count < min_followers)
-        
-        non_followers = query.all()
+        ).all()
         
         print(f"[NON-FOLLOWERS] Found {len(non_followers)} non-followers after filtering")
         
@@ -651,6 +691,7 @@ async def get_non_followers(
                 UserInfo(
                     username=user.username,
                     full_name=user.full_name or "",
+                    profile_pic_url=user.profile_pic_url or "",
                     is_verified=user.is_verified,
                     follower_count=user.follower_count,
                     is_following_me=user.is_following_me,
@@ -705,29 +746,59 @@ async def unfollow_users(
             )
         
         print(f"[UNFOLLOW] Daily limit check passed: {today_unfollows}/{settings.max_daily_unfollows}")
-        print(f"[UNFOLLOW] Running batch unfollow in thread pool...")
         
-        # Run batch unfollow in thread pool
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            executor,
-            instagram_unfollow_batch,
-            request.usernames,
-            db_session.cookies,
-            settings.min_action_delay,
-            settings.max_action_delay,
-            False  # headless=False to see browser
-        )
+        # Fetch user IDs from database for API unfollow
+        print(f"[UNFOLLOW] Fetching user IDs from database...")
+        users_with_ids = []
+        users_without_ids = []
         
-        if not result['success']:
-            print(f"[UNFOLLOW] Batch unfollow completed with errors")
+        for username in request.usernames:
+            user = db.query(User).filter(User.username == username).first()
+            if user and user.user_id:
+                users_with_ids.append({'username': username, 'user_id': user.user_id})
+            else:
+                users_without_ids.append(username)
         
-        batch_results = result['results']
-        print(f"[UNFOLLOW] Processing {len(batch_results)} results...")
+        print(f"[UNFOLLOW] Users with ID (API method): {len(users_with_ids)}")
+        print(f"[UNFOLLOW] Users without ID (Playwright fallback): {len(users_without_ids)}")
+        
+        all_results = []
+        
+        # Try API unfollow first (primary method)
+        if users_with_ids:
+            print(f"[UNFOLLOW] Running API batch unfollow for {len(users_with_ids)} users...")
+            loop = asyncio.get_event_loop()
+            api_result = await loop.run_in_executor(
+                executor,
+                instagram_unfollow_batch_api,
+                users_with_ids,
+                db_session.cookies,
+                3  # 3 second delay between API calls
+            )
+            all_results.extend(api_result['results'])
+            print(f"[UNFOLLOW] API batch complete: {api_result['summary']['successful']}/{api_result['summary']['total']} successful")
+        
+        # Fallback to Playwright for users without IDs
+        if users_without_ids:
+            print(f"[UNFOLLOW] Running Playwright batch unfollow for {len(users_without_ids)} users...")
+            loop = asyncio.get_event_loop()
+            playwright_result = await loop.run_in_executor(
+                executor,
+                instagram_unfollow_batch,
+                users_without_ids,
+                db_session.cookies,
+                settings.min_action_delay,
+                settings.max_action_delay,
+                False  # headless=False to see browser
+            )
+            all_results.extend(playwright_result['results'])
+            print(f"[UNFOLLOW] Playwright batch complete: {playwright_result['summary']['successful']}/{playwright_result['summary']['total']} successful")
+        
+        print(f"[UNFOLLOW] Processing {len(all_results)} results...")
         
         # Log actions and update database
         errors = []
-        for unfollow_result in batch_results:
+        for unfollow_result in all_results:
             status = 'success' if unfollow_result['success'] else 'failed'
             action = Action(
                 action_type='unfollow',
@@ -751,13 +822,17 @@ async def unfollow_users(
         
         db.commit()
         
+        # Calculate summary
+        successful = sum(1 for r in all_results if r['success'])
+        failed = sum(1 for r in all_results if not r['success'])
+        
         print(f"[UNFOLLOW] ========================================")
-        print(f"[UNFOLLOW] Complete! Success: {result['summary']['successful']}, Failed: {result['summary']['failed']}")
+        print(f"[UNFOLLOW] Complete! Success: {successful}, Failed: {failed}")
         print(f"[UNFOLLOW] ========================================")
         
         return UnfollowResponse(
             success=len(errors) == 0,
-            results=batch_results,
+            results=all_results,
             errors=errors
         )
         
@@ -857,6 +932,22 @@ async def add_to_whitelist(
     except Exception as e:
         print(f"[WHITELIST] EXCEPTION: {str(e)}")
         db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/queue/clear")
+async def clear_unfollow_queue(db: Session = Depends(get_db)):
+    """Clear all pending items from the unfollow queue."""
+    try:
+        deleted = db.query(UnfollowQueue).filter(
+            UnfollowQueue.status.in_(['pending', 'processing', 'failed'])
+        ).delete(synchronize_session=False)
+        db.commit()
+        print(f"[QUEUE] Cleared {deleted} items from unfollow queue")
+        return {"success": True, "cleared": deleted}
+    except Exception as e:
+        db.rollback()
+        print(f"[QUEUE] Error clearing queue: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

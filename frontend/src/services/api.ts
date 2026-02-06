@@ -5,6 +5,7 @@ import type {
   UnfollowResponse,
   ActionLog,
   Stats,
+  WhitelistResponse,
 } from '../types';
 
 const api = axios.create({
@@ -26,30 +27,24 @@ export const authApi = {
 };
 
 export const analysisApi = {
-  getFollowers: async (username: string, sessionId: string, limit = 500) => {
+  getFollowers: async (username: string, sessionId: string, limit = 999999) => {
     const response = await api.get(`/analysis/followers/${username}`, {
       params: { session_id: sessionId, limit },
     });
     return response.data;
   },
 
-  getFollowing: async (username: string, sessionId: string, limit = 500) => {
+  getFollowing: async (username: string, sessionId: string, limit = 999999) => {
     const response = await api.get(`/analysis/following/${username}`, {
       params: { session_id: sessionId, limit },
     });
     return response.data;
   },
 
-  getNonFollowers: async (
-    sessionId: string,
-    minFollowers = 10000,
-    excludeVerified = true
-  ): Promise<AnalysisResponse> => {
+  getNonFollowers: async (sessionId: string): Promise<AnalysisResponse> => {
     const response = await api.get('/analysis/non-followers', {
       params: {
         session_id: sessionId,
-        min_followers: minFollowers,
-        exclude_verified: excludeVerified,
       },
     });
     return response.data;
@@ -81,6 +76,19 @@ export const logsApi = {
 export const statsApi = {
   getStats: async (): Promise<Stats> => {
     const response = await api.get('/stats');
+    return response.data;
+  },
+};
+
+export const whitelistApi = {
+  addToWhitelist: async (
+    usernames: string[],
+    reason?: string
+  ): Promise<WhitelistResponse> => {
+    const response = await api.post('/whitelist/add', {
+      usernames,
+      reason,
+    });
     return response.data;
   },
 };

@@ -25,11 +25,10 @@ interface DashboardProps {
 
 const Dashboard: React.FC<DashboardProps> = ({ sessionId, username, onLogout }) => {
   const [loading, setLoading] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
+  const [syncingFollowers, setSyncingFollowers] = useState(false);
+  const [syncingFollowing, setSyncingFollowing] = useState(false);
   const [nonFollowers, setNonFollowers] = useState<UserInfo[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
-  const [minFollowers, setMinFollowers] = useState(10000);
-  const [excludeVerified, setExcludeVerified] = useState(true);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -45,30 +44,45 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, username, onLogout }) 
     }
   };
 
-  const handleAnalyze = async () => {
-    setAnalyzing(true);
+  const handleSyncFollowers = async () => {
+    setSyncingFollowers(true);
     setError('');
 
     try {
-      // Fetch followers
-      await analysisApi.getFollowers(username, sessionId, 500);
+      await analysisApi.getFollowers(username, sessionId, 999999);
+      await loadStats();
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to sync followers');
+    } finally {
+      setSyncingFollowers(false);
+    }
+  };
 
-      // Fetch following
-      await analysisApi.getFollowing(username, sessionId, 500);
+  const handleSyncFollowing = async () => {
+    setSyncingFollowing(true);
+    setError('');
 
-      // Get non-followers
-      const analysis = await analysisApi.getNonFollowers(
-        sessionId,
-        minFollowers,
-        excludeVerified
-      );
+    try {
+      await analysisApi.getFollowing(username, sessionId, 999999);
+      await loadStats();
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to sync following');
+    } finally {
+      setSyncingFollowing(false);
+    }
+  };
+
+  const handleAnalyze = async () => {
+    setError('');
+
+    try {
+      // Get non-followers based on current database state
+      const analysis = await analysisApi.getNonFollowers(sessionId);
 
       setNonFollowers(analysis.non_followers);
       await loadStats();
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to analyze followers');
-    } finally {
-      setAnalyzing(false);
     }
   };
 
@@ -170,39 +184,6 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, username, onLogout }) 
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <label className="text-sm font-medium">
-                  Minimum Followers (to keep)
-                </label>
-                <input
-                  type="number"
-                  value={minFollowers}
-                  onChange={(e) => setMinFollowers(Number(e.target.value))}
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  placeholder="10000"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Keep accounts with more followers than this (likely influencers)
-                </p>
-              </div>
-
-              <div className="space-y-2">
-                <label className="flex items-center space-x-2">
-                  <input
-                    type="checkbox"
-                    checked={excludeVerified}
-                    onChange={(e) => setExcludeVerified(e.target.checked)}
-                    className="h-4 w-4 rounded border-gray-300"
-                  />
-                  <span className="text-sm font-medium">Exclude Verified Accounts</span>
-                </label>
-                <p className="text-xs text-muted-foreground">
-                  Automatically keep verified (blue checkmark) accounts
-                </p>
-              </div>
-            </div>
-
             {error && (
               <div className="bg-destructive/15 text-destructive px-4 py-3 rounded-md flex items-start gap-2">
                 <AlertTriangle className="h-5 w-5 mt-0.5 flex-shrink-0" />
@@ -213,31 +194,62 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, username, onLogout }) 
             <div className="bg-amber-50 border border-amber-200 text-amber-800 px-4 py-3 rounded-md flex items-start gap-2">
               <Shield className="h-5 w-5 mt-0.5 flex-shrink-0" />
               <div className="text-sm">
-                <p className="font-medium mb-1">Safety Notice</p>
+                <p className="font-medium mb-1">Sync Instructions</p>
                 <p>
-                  This process will fetch up to 500 followers and 500 following. It may
-                  take a few minutes. Instagram rate limits apply.
+                  First sync your followers and following lists separately (may take a few minutes each).
+                  Then analyze to identify non-followers. Each sync is independent and safe to interrupt.
                 </p>
               </div>
             </div>
 
-            <Button
-              onClick={handleAnalyze}
-              disabled={analyzing}
-              className="w-full md:w-auto"
-            >
-              {analyzing ? (
-                <>
-                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                  Analyzing...
-                </>
-              ) : (
-                <>
-                  <RefreshCw className="mr-2 h-4 w-4" />
-                  Analyze Followers
-                </>
-              )}
-            </Button>
+            <div className="flex flex-col sm:flex-row gap-3">
+              <Button
+                onClick={handleSyncFollowers}
+                disabled={syncingFollowers}
+                className="flex-1"
+                variant="outline"
+              >
+                {syncingFollowers ? (
+                  <>
+                    <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                    Syncing Followers...
+                  </>
+                ) : (
+                  <>
+                    <Users className="mr-2 h-4 w-4" />
+                    Sync Followers
+                  </>
+                )}
+              </Button>
+
+              <Button
+                onClick={handleSyncFollowing}
+                disabled={syncingFollowing}
+                className="flex-1"
+                variant="outline"
+              >
+                {syncingFollowing ? (
+                  <>
+                    <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                    Syncing Following...
+                  </>
+                ) : (
+                  <>
+                    <TrendingUp className="mr-2 h-4 w-4" />
+                    Sync Following
+                  </>
+                )}
+              </Button>
+
+              <Button
+                onClick={handleAnalyze}
+                disabled={syncingFollowers || syncingFollowing}
+                className="flex-1"
+              >
+                <RefreshCw className="mr-2 h-4 w-4" />
+                Analyze Non-Followers
+              </Button>
+            </div>
           </CardContent>
         </Card>
 

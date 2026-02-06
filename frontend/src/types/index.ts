@@ -1,6 +1,7 @@
 export interface UserInfo {
   username: string;
   full_name?: string;
+  profile_pic_url?: string;
   is_verified: boolean;
   follower_count: number;
   is_following_me: boolean;
@@ -49,4 +50,11 @@ export interface Stats {
   today_unfollows: number;
   remaining_today: number;
   daily_limit: number;
+}
+
+export interface WhitelistResponse {
+  success: boolean;
+  added: string[];
+  already_whitelisted: string[];
+  not_found: string[];
 }
