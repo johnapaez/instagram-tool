@@ -6,7 +6,7 @@ A modern, full-stack web application for managing Instagram followers with intel
 
 This tool helps you identify and manage Instagram accounts that don't follow you back, while automatically excluding verified accounts and major influencers. Built with modern technologies and designed for Windows compatibility.
 
-**Current Status**: ✅ **Login automation fully working** | 🚧 Follower analysis coming soon
+**Current Status**: ✅ **Core features working** (login, follower analysis, unfollow, whitelist) | 🚧 Frontend UI updates in progress
 
 ## ⚠️ Important Disclaimer
 
@@ -194,10 +194,15 @@ MIT License - Use at your own risk
 
 Comprehensive documentation is available in the [`/docs`](docs/) folder:
 
+### Core Documentation
 - **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Detailed system architecture, data flow, and technical decisions
 - **[IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** - Implementation details, design patterns, and lessons learned
 - **[TODO.md](docs/TODO.md)** - Complete feature roadmap and development priorities
 - **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Common issues and solutions
+
+### Feature Documentation
+- **[LOGGING.md](docs/LOGGING.md)** - Logging system, debug artifacts, and log management
+- **[WHITELIST_FEATURE.md](docs/WHITELIST_FEATURE.md)** - Allow-list system for excluding specific users from analysis
 
 ## 🤝 Support
 
@@ -208,18 +213,21 @@ Comprehensive documentation is available in the [`/docs`](docs/) folder:
 
 ## 🗺️ Roadmap
 
-### ✅ Completed (Phase 1)
+### ✅ Completed (Phases 1-2)
 - Modern web stack (React + FastAPI)
 - Instagram login automation with Windows compatibility
 - Session management and security
+- Follower/following list analysis with smart scrolling
+- Non-follower detection with whitelist system
+- Batch unfollow functionality
 - Safety features (rate limiting, delays, daily limits)
+- Centralized logging system with debug artifacts
 - Activity logging and statistics
 - Comprehensive documentation
 
-### 🚧 In Progress (Phase 2)
-- Follower/following list analysis
-- Non-follower detection
-- Batch unfollow functionality
+### 🚧 In Progress (Phase 3)
+- Frontend UI for whitelist management
+- Progress indicators and real-time updates
 
 ### 📋 Planned (Phase 3+)
 - Advanced filtering options

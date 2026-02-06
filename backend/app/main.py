@@ -16,7 +16,7 @@ if sys.platform == 'win32':
 from .config import settings
 from .database import get_db, init_db
 from .models import User, Action, Session as DBSession, UnfollowQueue
-from .instagram_sync import instagram_login
+from .instagram_sync import instagram_login, instagram_get_followers, instagram_get_following, instagram_unfollow_batch
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(
@@ -91,6 +91,18 @@ class ActionLog(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class WhitelistRequest(BaseModel):
+    usernames: List[str]
+    reason: Optional[str] = None
+
+
+class WhitelistResponse(BaseModel):
+    success: bool
+    added: List[str] = []
+    already_whitelisted: List[str] = []
+    not_found: List[str] = []
 
 
 # Event handlers
@@ -219,17 +231,18 @@ async def logout(session_id: str, db: Session = Depends(get_db)):
 async def get_followers(
     username: str,
     session_id: str,
-    limit: int = 500,
+    limit: int = 999999,  # Very high limit = fetch all
     db: Session = Depends(get_db)
 ):
-    """Get followers list - TEMPORARILY DISABLED."""
-    raise HTTPException(
-        status_code=501,
-        detail="Follower analysis feature is being updated for Windows compatibility. Login is working! Full features coming soon."
-    )
+    """Get ALL followers list using synchronous Playwright.
     
-    # Original code commented out for now
+    Will scroll through entire followers list to get complete data.
     """
+    print(f"[FOLLOWERS] ========================================")
+    print(f"[FOLLOWERS] Fetching ALL followers for: {username}")
+    print(f"[FOLLOWERS] (Will scroll until complete - may take time)")
+    print(f"[FOLLOWERS] ========================================")
+    
     try:
         # Check if session exists and is active
         db_session = db.query(DBSession).filter(
@@ -240,18 +253,36 @@ async def get_followers(
         if not db_session:
             raise HTTPException(status_code=401, detail="Invalid or expired session")
         
-        # Get or create bot
-        if session_id not in active_bots:
-            # TODO: Implement with sync Playwright
-            pass
-        else:
-            bot = active_bots[session_id]
+        print(f"[FOLLOWERS] Session valid, fetching followers...")
         
-        # Fetch followers
-        followers = await bot.get_followers(username, limit)
+        # Run in thread pool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            instagram_get_followers,
+            username,
+            db_session.cookies,
+            limit,
+            False  # headless=False to see browser
+        )
+        
+        if not result['success']:
+            print(f"[FOLLOWERS] FAILED: {result.get('error')}")
+            raise HTTPException(status_code=500, detail=result.get('error', 'Failed to fetch followers'))
+        
+        followers = result['followers']
+        print(f"[FOLLOWERS] Successfully fetched {len(followers)} followers")
+        
+        # IMPORTANT: Reset all is_following_me flags to False before updating
+        # This ensures stale data doesn't persist
+        print(f"[FOLLOWERS] Resetting all is_following_me flags...")
+        db.query(User).update({User.is_following_me: False})
+        db.commit()
         
         # Store in database
+        follower_usernames = set()
         for follower in followers:
+            follower_usernames.add(follower['username'])
             existing_user = db.query(User).filter(User.username == follower['username']).first()
             if existing_user:
                 existing_user.full_name = follower.get('full_name', '')
@@ -268,6 +299,8 @@ async def get_followers(
                 )
                 db.add(new_user)
         
+        print(f"[FOLLOWERS] Stored {len(follower_usernames)} unique followers")
+        
         # Log action
         action = Action(
             action_type='fetch_followers',
@@ -278,32 +311,40 @@ async def get_followers(
         db.add(action)
         db.commit()
         
+        print(f"[FOLLOWERS] SUCCESS! Stored in database.")
         return {
             "success": True,
             "count": len(followers),
             "followers": followers
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"[FOLLOWERS] EXCEPTION: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    """
 
 
 @app.get("/api/analysis/following/{username}")
 async def get_following(
     username: str,
     session_id: str,
-    limit: int = 500,
+    limit: int = 999999,  # Very high limit = fetch all
     db: Session = Depends(get_db)
 ):
-    """Get following list - TEMPORARILY DISABLED."""
-    raise HTTPException(
-        status_code=501,
-        detail="Following analysis feature is being updated for Windows compatibility. Login is working! Full features coming soon."
-    )
+    """Get ALL following list using synchronous Playwright.
     
+    Will scroll through entire following list to get complete data.
     """
+    print(f"[FOLLOWING] ========================================")
+    print(f"[FOLLOWING] Fetching ALL following for: {username}")
+    print(f"[FOLLOWING] (Will scroll until complete - may take time)")
+    print(f"[FOLLOWING] ========================================")
+    
     try:
+        # Check if session exists and is active
         db_session = db.query(DBSession).filter(
             DBSession.session_id == session_id,
             DBSession.is_active == True
@@ -312,17 +353,172 @@ async def get_following(
         if not db_session:
             raise HTTPException(status_code=401, detail="Invalid or expired session")
         
-        if session_id not in active_bots:
-            bot = InstagramBot()
-            await bot.start(headless=True)
-            await bot.load_session(db_session.cookies)
-            active_bots[session_id] = bot
-        else:
-            bot = active_bots[session_id]
+        print(f"[FOLLOWING] Session valid, fetching following...")
         
-        following = await bot.get_following(username, limit)
+        # Run in thread pool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            instagram_get_following,
+            username,
+            db_session.cookies,
+            limit,
+            False  # headless=False to see browser
+        )
+        
+        if not result['success']:
+            print(f"[FOLLOWING] FAILED: {result.get('error')}")
+            raise HTTPException(status_code=500, detail=result.get('error', 'Failed to fetch following'))
+        
+        following = result['following']
+        print(f"[FOLLOWING] Successfully fetched {len(following)} following")
+        
+        # IMPORTANT: Reset all i_am_following flags to False before updating
+        # This ensures stale data doesn't persist
+        print(f"[FOLLOWING] Resetting all i_am_following flags...")
+        db.query(User).update({User.i_am_following: False})
+        db.commit()
         
         # Store in database
+        following_usernames = set()
+        for followed_user in following:
+            following_usernames.add(followed_user['username'])
+            existing_user = db.query(User).filter(User.username == followed_user['username']).first()
+            if existing_user:
+                existing_user.full_name = followed_user.get('full_name', '')
+                existing_user.is_verified = followed_user.get('is_verified', False)
+                existing_user.i_am_following = True
+                existing_user.updated_at = datetime.utcnow()
+            else:
+                new_user = User(
+                    username=followed_user['username'],
+                    user_id=followed_user['username'],
+                    full_name=followed_user.get('full_name', ''),
+                    is_verified=followed_user.get('is_verified', False),
+                    i_am_following=True
+                )
+                db.add(new_user)
+        
+        print(f"[FOLLOWING] Stored {len(following_usernames)} unique following users")
+        
+        # Log action
+        action = Action(
+            action_type='fetch_following',
+            username=username,
+            status='success',
+            details={'count': len(following)}
+        )
+        db.add(action)
+        db.commit()
+        
+        print(f"[FOLLOWING] SUCCESS! Stored in database.")
+        return {
+            "success": True,
+            "count": len(following),
+            "following": following
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[FOLLOWING] EXCEPTION: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/analysis/complete")
+async def complete_analysis(
+    username: str,
+    session_id: str,
+    limit: int = 999999,  # Very high limit = fetch all users
+    db: Session = Depends(get_db)
+):
+    """Perform complete analysis - fetch ALL followers and following, then identify non-followers.
+    
+    NOTE: This will scroll through ENTIRE lists to get complete data.
+    May take several minutes for accounts with thousands of followers/following.
+    """
+    print(f"[COMPLETE ANALYSIS] ========================================")
+    print(f"[COMPLETE ANALYSIS] Starting COMPLETE analysis for: {username}")
+    print(f"[COMPLETE ANALYSIS] Will fetch ALL followers and following (may take time)")
+    print(f"[COMPLETE ANALYSIS] ========================================")
+    
+    try:
+        # Check session
+        db_session = db.query(DBSession).filter(
+            DBSession.session_id == session_id,
+            DBSession.is_active == True
+        ).first()
+        
+        if not db_session:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        
+        # Reset ALL flags first to ensure clean slate
+        print(f"[COMPLETE ANALYSIS] Resetting all user flags...")
+        db.query(User).update({
+            User.is_following_me: False,
+            User.i_am_following: False
+        })
+        db.commit()
+        
+        loop = asyncio.get_event_loop()
+        
+        # 1. Fetch followers
+        print(f"[COMPLETE ANALYSIS] Step 1: Fetching followers...")
+        followers_result = await loop.run_in_executor(
+            executor,
+            instagram_get_followers,
+            username,
+            db_session.cookies,
+            limit,
+            False
+        )
+        
+        if not followers_result['success']:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch followers: {followers_result.get('error')}")
+        
+        followers = followers_result['followers']
+        print(f"[COMPLETE ANALYSIS] Fetched {len(followers)} followers")
+        
+        # 2. Fetch following
+        print(f"[COMPLETE ANALYSIS] Step 2: Fetching following...")
+        following_result = await loop.run_in_executor(
+            executor,
+            instagram_get_following,
+            username,
+            db_session.cookies,
+            limit,
+            False
+        )
+        
+        if not following_result['success']:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch following: {following_result.get('error')}")
+        
+        following = following_result['following']
+        print(f"[COMPLETE ANALYSIS] Fetched {len(following)} following")
+        
+        # 3. Store followers in database
+        print(f"[COMPLETE ANALYSIS] Step 3: Storing followers...")
+        for follower in followers:
+            existing_user = db.query(User).filter(User.username == follower['username']).first()
+            if existing_user:
+                existing_user.full_name = follower.get('full_name', '')
+                existing_user.is_verified = follower.get('is_verified', False)
+                existing_user.is_following_me = True
+                existing_user.updated_at = datetime.utcnow()
+            else:
+                new_user = User(
+                    username=follower['username'],
+                    user_id=follower['username'],
+                    full_name=follower.get('full_name', ''),
+                    is_verified=follower.get('is_verified', False),
+                    is_following_me=True
+                )
+                db.add(new_user)
+        
+        # 4. Store following in database
+        print(f"[COMPLETE ANALYSIS] Step 4: Storing following...")
         for followed_user in following:
             existing_user = db.query(User).filter(User.username == followed_user['username']).first()
             if existing_user:
@@ -340,24 +536,65 @@ async def get_following(
                 )
                 db.add(new_user)
         
-        action = Action(
+        # Log actions
+        db.add(Action(
+            action_type='fetch_followers',
+            username=username,
+            status='success',
+            details={'count': len(followers)}
+        ))
+        db.add(Action(
             action_type='fetch_following',
             username=username,
             status='success',
             details={'count': len(following)}
-        )
-        db.add(action)
+        ))
+        
         db.commit()
+        
+        # Calculate and display statistics
+        followers_set = set(f['username'] for f in followers)
+        following_set = set(f['username'] for f in following)
+        mutual = followers_set & following_set
+        not_following_back = following_set - followers_set
+        
+        print(f"[COMPLETE ANALYSIS] ========================================")
+        print(f"[COMPLETE ANALYSIS] Analysis complete!")
+        print(f"[COMPLETE ANALYSIS] ========================================")
+        print(f"[COMPLETE ANALYSIS] Followers: {len(followers)}")
+        print(f"[COMPLETE ANALYSIS] Following: {len(following)}")
+        print(f"[COMPLETE ANALYSIS] Mutual (follow each other): {len(mutual)}")
+        print(f"[COMPLETE ANALYSIS] Not following back: {len(not_following_back)}")
+        print(f"[COMPLETE ANALYSIS] ========================================")
+        
+        # Verify data was saved correctly
+        db_followers = db.query(User).filter(User.is_following_me == True).count()
+        db_following = db.query(User).filter(User.i_am_following == True).count()
+        db_non_followers = db.query(User).filter(
+            User.i_am_following == True,
+            User.is_following_me == False
+        ).count()
+        
+        print(f"[COMPLETE ANALYSIS] Database verification:")
+        print(f"[COMPLETE ANALYSIS]   - Followers in DB: {db_followers}")
+        print(f"[COMPLETE ANALYSIS]   - Following in DB: {db_following}")
+        print(f"[COMPLETE ANALYSIS]   - Non-followers in DB: {db_non_followers}")
+        print(f"[COMPLETE ANALYSIS] ========================================")
         
         return {
             "success": True,
-            "count": len(following),
-            "following": following
+            "followers_count": len(followers),
+            "following_count": len(following),
+            "message": "Analysis complete. Use /api/analysis/non-followers to get results."
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"[COMPLETE ANALYSIS] EXCEPTION: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    """
 
 
 @app.get("/api/analysis/non-followers", response_model=AnalysisResponse)
@@ -368,11 +605,26 @@ async def get_non_followers(
     db: Session = Depends(get_db)
 ):
     """Get list of users who don't follow back."""
+    print(f"[NON-FOLLOWERS] ========================================")
+    print(f"[NON-FOLLOWERS] Analyzing non-followers")
+    print(f"[NON-FOLLOWERS] Filters: verified={exclude_verified}, min_followers={min_followers}")
+    print(f"[NON-FOLLOWERS] ========================================")
+    
     try:
+        # Get totals first for debugging
+        total_followers = db.query(User).filter(User.is_following_me == True).count()
+        total_following = db.query(User).filter(User.i_am_following == True).count()
+        
+        print(f"[NON-FOLLOWERS] Total in database:")
+        print(f"[NON-FOLLOWERS]   - Users following me: {total_followers}")
+        print(f"[NON-FOLLOWERS]   - Users I'm following: {total_following}")
+        
         # Get all users I'm following but who don't follow me
+        # EXCLUDE whitelisted users
         query = db.query(User).filter(
             User.i_am_following == True,
-            User.is_following_me == False
+            User.is_following_me == False,
+            User.is_whitelisted == False  # Don't show whitelisted users
         )
         
         # Apply filters
@@ -384,9 +636,13 @@ async def get_non_followers(
         
         non_followers = query.all()
         
-        # Get totals
-        total_followers = db.query(User).filter(User.is_following_me == True).count()
-        total_following = db.query(User).filter(User.i_am_following == True).count()
+        print(f"[NON-FOLLOWERS] Found {len(non_followers)} non-followers after filtering")
+        
+        # Debug: show first few non-followers
+        if len(non_followers) > 0:
+            print(f"[NON-FOLLOWERS] First few results:")
+            for user in non_followers[:5]:
+                print(f"[NON-FOLLOWERS]   - @{user.username}: following_me={user.is_following_me}, i_follow={user.i_am_following}")
         
         return AnalysisResponse(
             total_followers=total_followers,
@@ -406,6 +662,9 @@ async def get_non_followers(
         )
         
     except Exception as e:
+        print(f"[NON-FOLLOWERS] EXCEPTION: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -415,13 +674,11 @@ async def unfollow_users(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Unfollow users - TEMPORARILY DISABLED."""
-    raise HTTPException(
-        status_code=501,
-        detail="Unfollow feature is being updated for Windows compatibility. Login is working! Full features coming soon."
-    )
+    """Unfollow users using synchronous Playwright."""
+    print(f"[UNFOLLOW] ========================================")
+    print(f"[UNFOLLOW] Unfollow request for {len(request.usernames)} users")
+    print(f"[UNFOLLOW] ========================================")
     
-    """
     try:
         # Check session
         db_session = db.query(DBSession).filter(
@@ -441,61 +698,76 @@ async def unfollow_users(
         ).count()
         
         if today_unfollows + len(request.usernames) > settings.max_daily_unfollows:
+            print(f"[UNFOLLOW] Daily limit exceeded: {today_unfollows}/{settings.max_daily_unfollows}")
             raise HTTPException(
                 status_code=429,
                 detail=f"Daily limit exceeded. Already unfollowed {today_unfollows} users today. Limit is {settings.max_daily_unfollows}."
             )
         
-        # Get bot
-        if request.session_id not in active_bots:
-            bot = InstagramBot()
-            await bot.start(headless=True)
-            await bot.load_session(db_session.cookies)
-            active_bots[request.session_id] = bot
-        else:
-            bot = active_bots[request.session_id]
+        print(f"[UNFOLLOW] Daily limit check passed: {today_unfollows}/{settings.max_daily_unfollows}")
+        print(f"[UNFOLLOW] Running batch unfollow in thread pool...")
         
-        # Unfollow users
-        results = await bot.unfollow_batch(
+        # Run batch unfollow in thread pool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            instagram_unfollow_batch,
             request.usernames,
+            db_session.cookies,
             settings.min_action_delay,
-            settings.max_action_delay
+            settings.max_action_delay,
+            False  # headless=False to see browser
         )
         
-        # Log actions
+        if not result['success']:
+            print(f"[UNFOLLOW] Batch unfollow completed with errors")
+        
+        batch_results = result['results']
+        print(f"[UNFOLLOW] Processing {len(batch_results)} results...")
+        
+        # Log actions and update database
         errors = []
-        for result in results:
-            status = 'success' if result['success'] else 'failed'
+        for unfollow_result in batch_results:
+            status = 'success' if unfollow_result['success'] else 'failed'
             action = Action(
                 action_type='unfollow',
-                username=result['username'],
+                username=unfollow_result['username'],
                 status=status,
-                details=result
+                details=unfollow_result
             )
             db.add(action)
             
-            if result['success']:
+            if unfollow_result['success']:
                 # Update user in database
-                user = db.query(User).filter(User.username == result['username']).first()
+                user = db.query(User).filter(User.username == unfollow_result['username']).first()
                 if user:
                     user.i_am_following = False
                     user.updated_at = datetime.utcnow()
+                print(f"[UNFOLLOW] ✓ {unfollow_result['username']}")
             else:
-                errors.append(f"{result['username']}: {result.get('error', 'Unknown error')}")
+                error_msg = f"{unfollow_result['username']}: {unfollow_result.get('error', 'Unknown error')}"
+                errors.append(error_msg)
+                print(f"[UNFOLLOW] ✗ {error_msg}")
         
         db.commit()
         
+        print(f"[UNFOLLOW] ========================================")
+        print(f"[UNFOLLOW] Complete! Success: {result['summary']['successful']}, Failed: {result['summary']['failed']}")
+        print(f"[UNFOLLOW] ========================================")
+        
         return UnfollowResponse(
             success=len(errors) == 0,
-            results=results,
+            results=batch_results,
             errors=errors
         )
         
     except HTTPException:
         raise
     except Exception as e:
+        print(f"[UNFOLLOW] EXCEPTION: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    """
 
 
 @app.get("/api/logs", response_model=List[ActionLog])
@@ -514,6 +786,160 @@ async def get_logs(
         logs = query.limit(limit).all()
         
         return logs
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/whitelist/add", response_model=WhitelistResponse)
+async def add_to_whitelist(
+    request: WhitelistRequest,
+    db: Session = Depends(get_db)
+):
+    """Add users to the allow-list (whitelist) - they won't appear in non-followers."""
+    print(f"[WHITELIST] ========================================")
+    print(f"[WHITELIST] Adding {len(request.usernames)} users to whitelist")
+    print(f"[WHITELIST] Reason: {request.reason or 'No reason provided'}")
+    print(f"[WHITELIST] ========================================")
+    
+    added = []
+    already_whitelisted = []
+    not_found = []
+    
+    try:
+        for username in request.usernames:
+            user = db.query(User).filter(User.username == username).first()
+            
+            if not user:
+                # User doesn't exist in database - create them as whitelisted
+                print(f"[WHITELIST] User @{username} not in database, creating...")
+                new_user = User(
+                    username=username,
+                    user_id=username,
+                    is_whitelisted=True,
+                    whitelist_reason=request.reason
+                )
+                db.add(new_user)
+                added.append(username)
+            elif user.is_whitelisted:
+                print(f"[WHITELIST] User @{username} already whitelisted")
+                already_whitelisted.append(username)
+            else:
+                print(f"[WHITELIST] Adding @{username} to whitelist")
+                user.is_whitelisted = True
+                user.whitelist_reason = request.reason
+                user.updated_at = datetime.utcnow()
+                added.append(username)
+        
+        # Log action
+        action = Action(
+            action_type='whitelist_add',
+            username=', '.join(request.usernames),
+            status='success',
+            details={
+                'count': len(added),
+                'reason': request.reason,
+                'usernames': added
+            }
+        )
+        db.add(action)
+        db.commit()
+        
+        print(f"[WHITELIST] SUCCESS! Added: {len(added)}, Already whitelisted: {len(already_whitelisted)}")
+        
+        return WhitelistResponse(
+            success=True,
+            added=added,
+            already_whitelisted=already_whitelisted,
+            not_found=not_found
+        )
+        
+    except Exception as e:
+        print(f"[WHITELIST] EXCEPTION: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/whitelist/remove")
+async def remove_from_whitelist(
+    usernames: List[str],
+    db: Session = Depends(get_db)
+):
+    """Remove users from the allow-list (whitelist)."""
+    print(f"[WHITELIST] ========================================")
+    print(f"[WHITELIST] Removing {len(usernames)} users from whitelist")
+    print(f"[WHITELIST] ========================================")
+    
+    removed = []
+    not_whitelisted = []
+    not_found = []
+    
+    try:
+        for username in usernames:
+            user = db.query(User).filter(User.username == username).first()
+            
+            if not user:
+                print(f"[WHITELIST] User @{username} not found in database")
+                not_found.append(username)
+            elif not user.is_whitelisted:
+                print(f"[WHITELIST] User @{username} not whitelisted")
+                not_whitelisted.append(username)
+            else:
+                print(f"[WHITELIST] Removing @{username} from whitelist")
+                user.is_whitelisted = False
+                user.whitelist_reason = None
+                user.updated_at = datetime.utcnow()
+                removed.append(username)
+        
+        # Log action
+        action = Action(
+            action_type='whitelist_remove',
+            username=', '.join(usernames),
+            status='success',
+            details={
+                'count': len(removed),
+                'usernames': removed
+            }
+        )
+        db.add(action)
+        db.commit()
+        
+        print(f"[WHITELIST] SUCCESS! Removed: {len(removed)}")
+        
+        return {
+            "success": True,
+            "removed": removed,
+            "not_whitelisted": not_whitelisted,
+            "not_found": not_found
+        }
+        
+    except Exception as e:
+        print(f"[WHITELIST] EXCEPTION: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/whitelist")
+async def get_whitelist(db: Session = Depends(get_db)):
+    """Get all whitelisted users."""
+    try:
+        whitelisted_users = db.query(User).filter(User.is_whitelisted == True).all()
+        
+        return {
+            "success": True,
+            "count": len(whitelisted_users),
+            "users": [
+                {
+                    "username": user.username,
+                    "full_name": user.full_name or "",
+                    "reason": user.whitelist_reason,
+                    "is_following_me": user.is_following_me,
+                    "i_am_following": user.i_am_following,
+                    "added_at": user.updated_at.isoformat() if user.updated_at else None
+                }
+                for user in whitelisted_users
+            ]
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -539,11 +965,14 @@ async def get_stats(db: Session = Depends(get_db)):
             Action.created_at >= datetime.combine(today, datetime.min.time())
         ).count()
         
+        whitelisted_count = db.query(User).filter(User.is_whitelisted == True).count()
+        
         return {
             "total_users": total_users,
             "total_followers": total_followers,
             "total_following": total_following,
             "non_followers": non_followers,
+            "whitelisted_users": whitelisted_count,
             "today_unfollows": today_unfollows,
             "remaining_today": max(0, settings.max_daily_unfollows - today_unfollows),
             "daily_limit": settings.max_daily_unfollows

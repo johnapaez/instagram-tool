@@ -504,31 +504,75 @@ test('user can login', async ({ page }) => {
 
 ## Debugging Tools
 
-### Backend Logging
+### Centralized Logging System
 
-**Structured logging with prefixes**:
+**Implementation**: All Playwright operations log to both console and timestamped files.
+
 ```python
-print(f"[LOGIN] Starting login for user: {username}")
-print(f"[PLAYWRIGHT] Navigating to Instagram...")
-print(f"[DATABASE] Storing session: {session_id}")
+# backend/app/instagram_sync.py
+def _get_log_file():
+    """Get or create the log file for this Playwright session."""
+    global _log_file
+    if _log_file is None:
+        log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        _log_file = os.path.join(log_dir, f'playwright_{timestamp}.log')
+    return _log_file
+
+def _log(message: str):
+    """Log message to both stdout and file."""
+    print(message)
+    sys.stdout.flush()  # Force immediate output (critical for ThreadPoolExecutor)
+    try:
+        with open(_get_log_file(), 'a', encoding='utf-8') as f:
+            f.write(f"{message}\n")
+    except:
+        pass
 ```
 
-**Benefits**:
-- Easy log filtering
-- Clear context
-- Searchable logs
+**Usage throughout codebase**:
+```python
+_log(f"[PLAYWRIGHT] Starting followers fetch for {username}...")
+_log(f"[PLAYWRIGHT] +{new_users} new followers (total: {len(followers)})")
+_log(f"[PLAYWRIGHT] Scroll: {before}px to {after}px")
+```
+
+**Why `sys.stdout.flush()`?**
+- ThreadPoolExecutor buffers stdout by default
+- Logs weren't appearing in uvicorn terminal
+- `flush()` forces immediate visibility
+- File logging provides backup for debugging
+
+**Log structure**:
+```
+backend/logs/
+├── playwright_20260205_163045.log  # One per session
+├── playwright_20260205_171230.log
+└── debug/
+    ├── followers_error_20260205_163512.png
+    └── unfollow_error_johndoe_20260205_180015.png
+```
+
+See **[LOGGING.md](LOGGING.md)** for complete documentation.
 
 ### Screenshot on Error
 
 ```python
 try:
     page.wait_for_selector('input[name="username"]', timeout=30000)
-except Exception:
-    screenshot_path = f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+except Exception as e:
+    _log(f"[PLAYWRIGHT] Exception: {str(e)}")
+    screenshot_path = f"backend/logs/debug/error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
     page.screenshot(path=screenshot_path)
-    print(f"Screenshot saved: {screenshot_path}")
+    _log(f"[PLAYWRIGHT] Error screenshot saved to: {screenshot_path}")
     raise
 ```
+
+**Benefits**:
+- Organized in `logs/debug/` directory
+- Timestamped filenames
+- Excluded from git automatically
 
 ### Browser DevTools
 

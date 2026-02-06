@@ -19,6 +19,8 @@ class User(Base):
     following_count = Column(Integer, default=0)
     is_following_me = Column(Boolean, default=False)
     i_am_following = Column(Boolean, default=False)
+    is_whitelisted = Column(Boolean, default=False)  # Allow-list: won't show in non-followers
+    whitelist_reason = Column(String, nullable=True)  # Optional reason (family, friend, celebrity, etc.)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

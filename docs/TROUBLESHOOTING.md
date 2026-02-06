@@ -423,13 +423,40 @@ venv\Scripts\python.exe -m uvicorn app.main:app
 
 ## Advanced Debugging
 
+### View Playwright Logs
+
+All Playwright operations are automatically logged to timestamped files in `backend/logs/`.
+
+**Quick check:**
+```powershell
+# View the most recent log file
+Get-ChildItem "backend\logs\*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content -Tail 50
+```
+
+**What's logged:**
+- All Playwright operations (navigation, clicks, scrolls)
+- User counts during follower/following fetch
+- Scroll attempts and results
+- Error messages with context
+
+See **[LOGGING.md](LOGGING.md)** for complete logging documentation.
+
+### Debug Screenshots
+
+Error screenshots are automatically saved to `backend/logs/debug/` when operations fail:
+- `followers_error_*.png` - Follower fetch errors
+- `following_error_*.png` - Following fetch errors
+- `unfollow_error_*.png` - Unfollow errors
+- `login_error_*.png` - Login errors
+
 ### Enable Detailed Logging
 
 ```python
-# In instagram_sync.py, add more print statements
-print(f"[DEBUG] Current URL: {page.url}")
-print(f"[DEBUG] Page title: {page.title()}")
-print(f"[DEBUG] Visible elements: {page.locator('*').count()}")
+# Logging is now centralized via _log() function in instagram_sync.py
+# All operations automatically log to both console and file
+# To add custom debug logging:
+from app.instagram_sync import _log
+_log(f"[DEBUG] Current URL: {page.url}")
 ```
 
 ### Use Playwright Inspector
